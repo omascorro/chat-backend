@@ -2,7 +2,7 @@ const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const USERS_FILE = './users.json';
 const PENDING_FILE = './pending_messages.json';
 
