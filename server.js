@@ -55,6 +55,23 @@ async function sendPushNotification(toUsername, fromUsername) {
     });
     const result = await response.json();
     console.log('🔔 Respuesta de Expo Push:', JSON.stringify(result));
+
+    if (result.data && result.data.id) {
+      const ticketId = result.data.id;
+      setTimeout(async () => {
+        try {
+          const receiptRes = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [ticketId] }),
+          });
+          const receiptData = await receiptRes.json();
+          console.log('🧾 Recibo de entrega:', JSON.stringify(receiptData));
+        } catch (e) {
+          console.log('Error obteniendo recibo:', e.message);
+        }
+      }, 15000);
+    }
   } catch (err) {
     console.log('⚠️ Error enviando push:', err.message);
   }
@@ -123,6 +140,7 @@ wss.on('connection', (socket) => {
     }
 
     if (parsed.type === 'direct-message') {
+      if (!myUsername) return; // Ignoramos mensajes de conexiones que no iniciaron sesión
       const fromPublicKey = registeredUsers[myUsername] ? registeredUsers[myUsername].publicKey : null;
       const payload = {
         type: 'direct-message',
