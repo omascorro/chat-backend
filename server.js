@@ -66,6 +66,23 @@ async function sendPushNotification(toUsername, fromUsername) {
     });
     const result2 = await response.json();
     console.log('🔔 Respuesta de Expo Push:', JSON.stringify(result2));
+
+    if (result2.data && result2.data.id) {
+      const ticketId = result2.data.id;
+      setTimeout(async () => {
+        try {
+          const receiptRes = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [ticketId] }),
+          });
+          const receiptData = await receiptRes.json();
+          console.log('🧾 Recibo de entrega:', JSON.stringify(receiptData));
+        } catch (e) {
+          console.log('Error obteniendo recibo:', e.message);
+        }
+      }, 15000);
+    }
   } catch (err) {
     console.log('⚠️ Error enviando push:', err.message);
   }
