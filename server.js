@@ -165,6 +165,18 @@ wss.on('connection', (socket) => {
         }
         return;
       }
+if (parsed.type === 'read-receipt') {
+        const recipient = onlineUsers.get(parsed.to);
+        if (recipient && recipient.socket.readyState === recipient.socket.OPEN) {
+          recipient.socket.send(JSON.stringify({
+            type: 'read-receipt',
+            from: myUsername,
+            messageId: parsed.messageId,
+          }));
+        }
+        return;
+      }
+
 
       if (parsed.type === 'direct-message') {
         if (!myUsername) return;
