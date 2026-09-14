@@ -20,6 +20,7 @@ async function initDatabase() {
     );
   `);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_messages (
       id SERIAL PRIMARY KEY,
@@ -38,10 +39,11 @@ const wss = new WebSocketServer({ port: PORT });
 const onlineUsers = new Map(); // username -> { socket, publicKey }
 
 async function broadcastUserList() {
-  const result = await pool.query('SELECT username, public_key FROM users');
+  const result = await pool.query('SELECT username, public_key, profile_picture FROM users');
   const list = result.rows.map((row) => ({
     username: row.username,
     publicKey: row.public_key,
+    profilePicture: row.profile_picture,
     online: onlineUsers.has(row.username),
   }));
   const payload = JSON.stringify({ type: 'user-list', users: list });
@@ -184,6 +186,15 @@ wss.on('connection', (socket) => {
         if (myUsername) {
           await pool.query('UPDATE users SET push_token = $1 WHERE username = $2', [parsed.token, myUsername]);
           console.log(`🔔 Token de notificaciones guardado para ${myUsername}`);
+        }
+        return;
+      }
+
+      if (parsed.type === 'update-profile-picture') {
+        if (myUsername) {
+          await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [parsed.profilePicture, myUsername]);
+          console.log(`🖼️ Foto de perfil actualizada para ${myUsername}`);
+          await broadcastUserList();
         }
         return;
       }
