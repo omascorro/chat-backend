@@ -1,6 +1,7 @@
 const { WebSocketServer } = require('ws');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 
@@ -18,6 +19,7 @@ async function initDatabase() {
       push_token TEXT
     );
   `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_messages (
       id SERIAL PRIMARY KEY,
@@ -62,6 +64,7 @@ async function sendPushNotification(toUsername, fromUsername) {
         title: 'Nuevo mensaje',
         body: `${fromUsername} te mandó un mensaje cifrado`,
         sound: 'default',
+        channelId: 'default',
       }),
     });
     const result2 = await response.json();
@@ -110,12 +113,31 @@ wss.on('connection', (socket) => {
         }
 
         const passwordHash = bcrypt.hashSync(password, 10);
+        const recoveryCode = crypto.randomBytes(6).toString('hex').toUpperCase();
+        const recoveryCodeHash = bcrypt.hashSync(recoveryCode, 10);
         await pool.query(
-          'INSERT INTO users (username, password_hash, public_key) VALUES ($1, $2, $3)',
-          [username, passwordHash, publicKey]
+          'INSERT INTO users (username, password_hash, public_key, recovery_code_hash) VALUES ($1, $2, $3, $4)',
+          [username, passwordHash, publicKey, recoveryCodeHash]
         );
         console.log(`📝 Nueva cuenta registrada: ${username}`);
-        socket.send(JSON.stringify({ type: 'register-result', success: true }));
+        socket.send(JSON.stringify({ type: 'register-result', success: true, recoveryCode }));
+        return;
+      }
+
+      if (parsed.type === 'reset-password') {
+        const { username, recoveryCode, newPassword } = parsed;
+        const result = await pool.query('SELECT recovery_code_hash FROM users WHERE username = $1', [username]);
+        const row = result.rows[0];
+
+        if (!row || !row.recovery_code_hash || !bcrypt.compareSync(recoveryCode, row.recovery_code_hash)) {
+          socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: 'Usuario o código de recuperación incorrectos' }));
+          return;
+        }
+
+        const newHash = bcrypt.hashSync(newPassword, 10);
+        await pool.query('UPDATE users SET password_hash = $1 WHERE username = $2', [newHash, username]);
+        console.log(`🔑 Contraseña restablecida para ${username}`);
+        socket.send(JSON.stringify({ type: 'reset-password-result', success: true }));
         return;
       }
 
@@ -165,7 +187,8 @@ wss.on('connection', (socket) => {
         }
         return;
       }
-if (parsed.type === 'read-receipt') {
+
+      if (parsed.type === 'read-receipt') {
         const recipient = onlineUsers.get(parsed.to);
         if (recipient && recipient.socket.readyState === recipient.socket.OPEN) {
           recipient.socket.send(JSON.stringify({
@@ -176,7 +199,6 @@ if (parsed.type === 'read-receipt') {
         }
         return;
       }
-
 
       if (parsed.type === 'direct-message') {
         if (!myUsername) return;
