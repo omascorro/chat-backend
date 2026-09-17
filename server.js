@@ -1,9 +1,10 @@
-const { WebSocketServer } = require('ws');
+﻿const { WebSocketServer } = require('ws');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -32,7 +33,7 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  console.log('✅ Tablas verificadas/creadas en la base de datos');
+  console.log('Tablas verificadas/creadas en la base de datos');
 }
 
 const wss = new WebSocketServer({ port: PORT });
@@ -70,7 +71,7 @@ async function sendPushNotification(toUsername, fromUsername) {
       }),
     });
     const result2 = await response.json();
-    console.log('🔔 Respuesta de Expo Push:', JSON.stringify(result2));
+    console.log('Respuesta de Expo Push:', JSON.stringify(result2));
 
     if (result2.data && result2.data.id) {
       const ticketId = result2.data.id;
@@ -82,19 +83,24 @@ async function sendPushNotification(toUsername, fromUsername) {
             body: JSON.stringify({ ids: [ticketId] }),
           });
           const receiptData = await receiptRes.json();
-          console.log('🧾 Recibo de entrega:', JSON.stringify(receiptData));
+          console.log('Recibo de entrega:', JSON.stringify(receiptData));
         } catch (e) {
           console.log('Error obteniendo recibo:', e.message);
         }
       }, 15000);
     }
   } catch (err) {
-    console.log('⚠️ Error enviando push:', err.message);
+    console.log('Error enviando push:', err.message);
   }
 }
 
 wss.on('connection', (socket) => {
   let myUsername = null;
+
+  socket.isAlive = true;
+  socket.on('pong', () => {
+    socket.isAlive = true;
+  });
 
   socket.on('message', async (data) => {
     let parsed;
@@ -121,7 +127,7 @@ wss.on('connection', (socket) => {
           'INSERT INTO users (username, password_hash, public_key, recovery_code_hash) VALUES ($1, $2, $3, $4)',
           [username, passwordHash, publicKey, recoveryCodeHash]
         );
-        console.log(`📝 Nueva cuenta registrada: ${username}`);
+        console.log(`Nueva cuenta registrada: ${username}`);
         socket.send(JSON.stringify({ type: 'register-result', success: true, recoveryCode }));
         return;
       }
@@ -138,7 +144,7 @@ wss.on('connection', (socket) => {
 
         const newHash = bcrypt.hashSync(newPassword, 10);
         await pool.query('UPDATE users SET password_hash = $1 WHERE username = $2', [newHash, username]);
-        console.log(`🔑 Contraseña restablecida para ${username}`);
+        console.log(`Contraseña restablecida para ${username}`);
         socket.send(JSON.stringify({ type: 'reset-password-result', success: true }));
         return;
       }
@@ -160,7 +166,7 @@ wss.on('connection', (socket) => {
         onlineUsers.set(username, { socket, publicKey });
         socket.send(JSON.stringify({ type: 'login-result', success: true }));
         await broadcastUserList();
-        console.log(`👤 ${username} inició sesión`);
+        console.log(`${username} inició sesión`);
 
         const pendingResult = await pool.query(
           'SELECT * FROM pending_messages WHERE to_username = $1 ORDER BY id ASC',
@@ -176,7 +182,7 @@ wss.on('connection', (socket) => {
               nonce: row.nonce,
             }));
           }
-          console.log(`📬 Entregados ${pendingResult.rows.length} mensaje(s) pendiente(s) a ${username}`);
+          console.log(`Entregados ${pendingResult.rows.length} mensaje(s) pendiente(s) a ${username}`);
           await pool.query('DELETE FROM pending_messages WHERE to_username = $1', [username]);
         }
         return;
@@ -185,7 +191,7 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'register-push-token') {
         if (myUsername) {
           await pool.query('UPDATE users SET push_token = $1 WHERE username = $2', [parsed.token, myUsername]);
-          console.log(`🔔 Token de notificaciones guardado para ${myUsername}`);
+          console.log(`Token de notificaciones guardado para ${myUsername}`);
         }
         return;
       }
@@ -193,7 +199,7 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'update-profile-picture') {
         if (myUsername) {
           await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [parsed.profilePicture, myUsername]);
-          console.log(`🖼️ Foto de perfil actualizada para ${myUsername}`);
+          console.log(`Foto de perfil actualizada para ${myUsername}`);
           await broadcastUserList();
         }
         return;
@@ -228,35 +234,50 @@ wss.on('connection', (socket) => {
         const recipient = onlineUsers.get(parsed.to);
         if (recipient && recipient.socket.readyState === recipient.socket.OPEN) {
           recipient.socket.send(JSON.stringify(payload));
-          console.log(`📩 Mensaje entregado: ${myUsername} → ${parsed.to}`);
+          console.log(`Mensaje entregado: ${myUsername} -> ${parsed.to}`);
         } else {
           await pool.query(
             'INSERT INTO pending_messages (to_username, from_username, from_public_key, ciphertext, nonce) VALUES ($1, $2, $3, $4, $5)',
             [parsed.to, myUsername, fromPublicKey, parsed.ciphertext, parsed.nonce]
           );
-          console.log(`📥 ${parsed.to} está desconectado, mensaje guardado para después`);
+          console.log(`${parsed.to} esta desconectado, mensaje guardado para despues`);
           await sendPushNotification(parsed.to, myUsername);
         }
         return;
       }
     } catch (err) {
-      console.log('⚠️ Error procesando mensaje:', err.message);
+      console.log('Error procesando mensaje:', err.message);
     }
   });
 
   socket.on('close', async () => {
     if (myUsername) {
       onlineUsers.delete(myUsername);
-      console.log(`❌ ${myUsername} se desconectó`);
+      console.log(`${myUsername} se desconecto`);
       await broadcastUserList();
     }
   });
 });
 
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    if (socket.isAlive === false) {
+      console.log('Terminando una conexion inactiva (zombie) que ya no respondia');
+      return socket.terminate();
+    }
+    socket.isAlive = false;
+    socket.ping();
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
+});
+
 initDatabase()
   .then(() => {
-    console.log(`🚀 Servidor de chat corriendo en el puerto ${PORT}`);
+    console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
   })
   .catch((err) => {
-    console.error('❌ Error inicializando la base de datos:', err);
+    console.error('Error inicializando la base de datos:', err);
   });
