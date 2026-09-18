@@ -33,10 +33,18 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query(`ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS counter INTEGER;`);
   console.log('Tablas verificadas/creadas en la base de datos');
 }
 
-const wss = new WebSocketServer({ port: PORT });
+const http = require('http');
+
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Servidor de chat activo');
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 const onlineUsers = new Map(); // username -> { socket, publicKey }
 
 async function broadcastUserList() {
@@ -180,6 +188,7 @@ wss.on('connection', (socket) => {
               fromPublicKey: row.from_public_key,
               ciphertext: row.ciphertext,
               nonce: row.nonce,
+              counter: row.counter,
             }));
           }
           console.log(`Entregados ${pendingResult.rows.length} mensaje(s) pendiente(s) a ${username}`);
@@ -229,6 +238,7 @@ wss.on('connection', (socket) => {
           fromPublicKey,
           ciphertext: parsed.ciphertext,
           nonce: parsed.nonce,
+          counter: parsed.counter,
         };
 
         const recipient = onlineUsers.get(parsed.to);
@@ -237,8 +247,8 @@ wss.on('connection', (socket) => {
           console.log(`Mensaje entregado: ${myUsername} -> ${parsed.to}`);
         } else {
           await pool.query(
-            'INSERT INTO pending_messages (to_username, from_username, from_public_key, ciphertext, nonce) VALUES ($1, $2, $3, $4, $5)',
-            [parsed.to, myUsername, fromPublicKey, parsed.ciphertext, parsed.nonce]
+            'INSERT INTO pending_messages (to_username, from_username, from_public_key, ciphertext, nonce, counter) VALUES ($1, $2, $3, $4, $5, $6)',
+            [parsed.to, myUsername, fromPublicKey, parsed.ciphertext, parsed.nonce, parsed.counter]
           );
           console.log(`${parsed.to} esta desconectado, mensaje guardado para despues`);
           await sendPushNotification(parsed.to, myUsername);
@@ -276,7 +286,9 @@ wss.on('close', () => {
 
 initDatabase()
   .then(() => {
-    console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
+    httpServer.listen(PORT, () => {
+      console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
+    });
   })
   .catch((err) => {
     console.error('Error inicializando la base de datos:', err);
