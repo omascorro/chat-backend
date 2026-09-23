@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const HEARTBEAT_INTERVAL_MS = 30000;
+const HEARTBEAT_INTERVAL_MS = 10000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
