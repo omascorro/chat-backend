@@ -280,8 +280,13 @@ const heartbeatInterval = setInterval(() => {
   });
 }, HEARTBEAT_INTERVAL_MS);
 
+const userListRefreshInterval = setInterval(() => {
+  broadcastUserList().catch((e) => console.log('Error actualizando la lista de usuarios en el intervalo:', e.message));
+}, 15000);
+
 wss.on('close', () => {
   clearInterval(heartbeatInterval);
+  clearInterval(userListRefreshInterval);
 });
 
 initDatabase()
@@ -293,3 +298,4 @@ initDatabase()
   .catch((err) => {
     console.error('Error inicializando la base de datos:', err);
   });
+  
