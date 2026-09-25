@@ -11,6 +11,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+pool.on('error', (err) => {
+  console.log('Error inesperado en la conexion a la base de datos (se ignora para no tumbar el servidor):', err.message);
+});
+
 async function initDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -308,4 +312,3 @@ initDatabase()
   .catch((err) => {
     console.error('Error inicializando la base de datos:', err);
   });
-  
