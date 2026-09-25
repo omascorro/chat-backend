@@ -114,6 +114,10 @@ wss.on('connection', (socket) => {
     socket.isAlive = true;
   });
 
+  socket.on('error', (err) => {
+    console.log('Error en una conexion individual (se ignora para no tumbar el servidor):', err.message);
+  });
+
   socket.on('message', async (data) => {
     let parsed;
     try {
@@ -301,6 +305,10 @@ const userListRefreshInterval = setInterval(() => {
 wss.on('close', () => {
   clearInterval(heartbeatInterval);
   clearInterval(userListRefreshInterval);
+});
+
+wss.on('error', (err) => {
+  console.log('Error en el servidor de WebSockets (se ignora para no tumbar el servidor):', err.message);
 });
 
 initDatabase()
