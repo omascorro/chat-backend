@@ -6,6 +6,14 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 3000;
 const HEARTBEAT_INTERVAL_MS = 10000;
 
+process.on('uncaughtException', (err) => {
+  console.log('Error no atrapado en algun lado (se ignora para no tumbar el servidor):', err.message);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.log('Promesa rechazada sin atrapar en algun lado (se ignora para no tumbar el servidor):', err && err.message ? err.message : err);
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -274,15 +282,19 @@ wss.on('connection', (socket) => {
   });
 
   socket.on('close', async () => {
-    if (myUsername) {
-      const current = onlineUsers.get(myUsername);
-      if (current && current.socket === socket) {
-        onlineUsers.delete(myUsername);
-        console.log(`${myUsername} se desconecto`);
-        await broadcastUserList();
-      } else {
-        console.log(`Se cerro una conexion vieja de ${myUsername} que ya habia sido reemplazada por una nueva, no se hace nada`);
+    try {
+      if (myUsername) {
+        const current = onlineUsers.get(myUsername);
+        if (current && current.socket === socket) {
+          onlineUsers.delete(myUsername);
+          console.log(`${myUsername} se desconecto`);
+          await broadcastUserList();
+        } else {
+          console.log(`Se cerro una conexion vieja de ${myUsername} que ya habia sido reemplazada por una nueva, no se hace nada`);
+        }
       }
+    } catch (err) {
+      console.log('Error manejando el cierre de una conexion (se ignora para no tumbar el servidor):', err.message);
     }
   });
 });
@@ -320,3 +332,4 @@ initDatabase()
   .catch((err) => {
     console.error('Error inicializando la base de datos:', err);
   });
+  
