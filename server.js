@@ -171,6 +171,11 @@ wss.on('connection', (socket) => {
         await pool.query('UPDATE users SET public_key = $1 WHERE username = $2', [publicKey, username]);
 
         myUsername = username;
+        const previousConnection = onlineUsers.get(username);
+        if (previousConnection && previousConnection.socket !== socket) {
+          console.log(`${username} ya tenia una conexion vieja abierta, cerrandola porque acaba de entrar con una nueva`);
+          previousConnection.socket.terminate();
+        }
         onlineUsers.set(username, { socket, publicKey });
         socket.send(JSON.stringify({ type: 'login-result', success: true }));
         await broadcastUserList();
@@ -262,9 +267,14 @@ wss.on('connection', (socket) => {
 
   socket.on('close', async () => {
     if (myUsername) {
-      onlineUsers.delete(myUsername);
-      console.log(`${myUsername} se desconecto`);
-      await broadcastUserList();
+      const current = onlineUsers.get(myUsername);
+      if (current && current.socket === socket) {
+        onlineUsers.delete(myUsername);
+        console.log(`${myUsername} se desconecto`);
+        await broadcastUserList();
+      } else {
+        console.log(`Se cerro una conexion vieja de ${myUsername} que ya habia sido reemplazada por una nueva, no se hace nada`);
+      }
     }
   });
 });
