@@ -202,7 +202,10 @@ wss.on('connection', (socket) => {
           [username]
         );
         if (pendingResult.rows.length > 0) {
+          // Solo se borran los mensajes que de verdad se enviaron; si llega uno nuevo mientras tanto, se queda guardado
+          const deliveredIds = [];
           for (const row of pendingResult.rows) {
+            if (socket.readyState !== socket.OPEN) break;
             socket.send(JSON.stringify({
               type: 'direct-message',
               from: row.from_username,
@@ -211,9 +214,12 @@ wss.on('connection', (socket) => {
               nonce: row.nonce,
               counter: row.counter,
             }));
+            deliveredIds.push(row.id);
           }
-          console.log(`Entregados ${pendingResult.rows.length} mensaje(s) pendiente(s) a ${username}`);
-          await pool.query('DELETE FROM pending_messages WHERE to_username = $1', [username]);
+          if (deliveredIds.length > 0) {
+            await pool.query('DELETE FROM pending_messages WHERE id = ANY($1::int[])', [deliveredIds]);
+          }
+          console.log(`Entregados ${deliveredIds.length} de ${pendingResult.rows.length} mensaje(s) pendiente(s) a ${username}`);
         }
         return;
       }
