@@ -6,8 +6,11 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 3000;
 const HEARTBEAT_INTERVAL_MS = 10000;
 
+// Despues de un error no atrapado el proceso puede quedar en un estado inconsistente (ej. usuarios "en linea" que no lo estan).
+// Es mas seguro apagarse de forma ordenada y dejar que Render lo reinicie limpio en unos segundos; la app se reconecta sola.
 process.on('uncaughtException', (err) => {
-  console.log('Error no atrapado en algun lado (se ignora para no tumbar el servidor):', err.message);
+  console.log('Error no atrapado, se reinicia el servidor de forma ordenada:', err && err.stack ? err.stack : err);
+  shutdown('uncaughtException', 1);
 });
 
 process.on('unhandledRejection', (err) => {
