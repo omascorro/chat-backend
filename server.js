@@ -2,6 +2,7 @@
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const sharp = require('sharp');
 
 const PORT = process.env.PORT || 3000;
 const HEARTBEAT_INTERVAL_MS = 10000;
@@ -139,6 +140,43 @@ async function loadKnownUsers() {
     knownUsers.set(row.username, { publicKey: row.public_key, profilePicture: row.profile_picture });
   }
   console.log(`${knownUsers.size} usuario(s) cargados en memoria`);
+}
+
+// La lista de usuarios (con fotos) se manda a todos cada 15 s, asi que las fotos se reducen al tamaño del avatar
+// de la app (40 pt, 120 px en pantallas 3x) para que cada una pese unos KB en vez de cientos.
+const PROFILE_PICTURE_SIZE_PX = 160;
+const PROFILE_PICTURE_MAX_BASE64_LENGTH = 20000; // las que ya son mas chicas que esto no se tocan
+
+async function shrinkProfilePicture(base64) {
+  const output = await sharp(Buffer.from(base64, 'base64'))
+    .rotate() // respeta la orientacion EXIF antes de quitar los metadatos
+    .resize(PROFILE_PICTURE_SIZE_PX, PROFILE_PICTURE_SIZE_PX, { fit: 'cover' })
+    .jpeg({ quality: 75 })
+    .toBuffer();
+  return output.toString('base64');
+}
+
+// Reduce las fotos que se guardaron antes de existir la reduccion. Corre en segundo plano al arrancar.
+async function shrinkExistingProfilePictures() {
+  let shrunk = 0;
+  for (const [username, info] of knownUsers) {
+    const original = info.profilePicture;
+    if (!original || original.length <= PROFILE_PICTURE_MAX_BASE64_LENGTH) continue;
+    try {
+      const small = await shrinkProfilePicture(original);
+      // Solo se reemplaza si nadie subio otra foto mientras tanto
+      const updated = await pool.query(
+        'UPDATE users SET profile_picture = $1 WHERE username = $2 AND profile_picture = $3',
+        [small, username, original]
+      );
+      if (updated.rowCount > 0 && info.profilePicture === original) info.profilePicture = small;
+      shrunk++;
+      console.log(`Foto de perfil de ${username} reducida de ${original.length} a ${small.length} caracteres`);
+    } catch (err) {
+      console.log(`No se pudo reducir la foto de perfil de ${username}, se deja como estaba:`, err.message);
+    }
+  }
+  if (shrunk > 0) broadcastUserList();
 }
 
 function broadcastUserList() {
@@ -375,10 +413,17 @@ wss.on('connection', (socket, req) => {
 
       if (parsed.type === 'update-profile-picture') {
         if (myUsername && typeof parsed.profilePicture === 'string') {
-          await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [parsed.profilePicture, myUsername]);
+          let profilePicture;
+          try {
+            profilePicture = await shrinkProfilePicture(parsed.profilePicture);
+          } catch (err) {
+            console.log(`La foto de perfil que mando ${myUsername} no es una imagen valida, se ignora:`, err.message);
+            return;
+          }
+          await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [profilePicture, myUsername]);
           const known = knownUsers.get(myUsername);
-          if (known) known.profilePicture = parsed.profilePicture;
-          console.log(`Foto de perfil actualizada para ${myUsername}`);
+          if (known) known.profilePicture = profilePicture;
+          console.log(`Foto de perfil actualizada para ${myUsername} (${parsed.profilePicture.length} -> ${profilePicture.length} caracteres)`);
           broadcastUserList();
         }
         return;
@@ -529,6 +574,7 @@ initDatabase()
     });
     httpServer.listen(PORT, () => {
       console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
+      shrinkExistingProfilePictures().catch((err) => console.log('Error reduciendo fotos de perfil existentes:', err.message));
     });
   })
   .catch((err) => {
