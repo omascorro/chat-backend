@@ -394,8 +394,7 @@ wss.on('connection', (socket, req) => {
           return;
         }
 
-        const userResult = await pool.query('SELECT public_key FROM users WHERE username = $1', [myUsername]);
-        const fromPublicKey = userResult.rows[0]?.public_key || null;
+        const fromPublicKey = knownUsers.get(myUsername)?.publicKey || null;
 
         const payload = {
           type: 'direct-message',
@@ -411,8 +410,7 @@ wss.on('connection', (socket, req) => {
           recipient.socket.send(JSON.stringify(payload));
           console.log(`Mensaje entregado: ${myUsername} -> ${parsed.to}`);
         } else {
-          const recipientExists = await pool.query('SELECT 1 FROM users WHERE username = $1', [parsed.to]);
-          if (recipientExists.rows.length === 0) {
+          if (!knownUsers.has(parsed.to)) {
             console.log(`${myUsername} intento mandar un mensaje a ${parsed.to}, que no existe; se descarta`);
             return;
           }
