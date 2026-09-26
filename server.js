@@ -46,6 +46,7 @@ async function initDatabase() {
     );
   `);
   await pool.query(`ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS counter INTEGER;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS pending_messages_to_username_idx ON pending_messages (to_username);`);
   console.log('Tablas verificadas/creadas en la base de datos');
 }
 
