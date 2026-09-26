@@ -226,7 +226,9 @@ wss.on('connection', (socket, req) => {
           return;
         }
 
-        const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+        // Se compara sin distinguir mayusculas para que nadie pueda registrar "Omar" si ya existe "omar".
+        // Los nombres se guardan tal cual y el login sigue siendo exacto, asi las cuentas existentes no cambian.
+        const existing = await pool.query('SELECT username FROM users WHERE LOWER(username) = LOWER($1)', [username]);
         if (existing.rows.length > 0) {
           socket.send(JSON.stringify({ type: 'register-result', success: false, error: 'Ese nombre de usuario ya existe' }));
           return;
