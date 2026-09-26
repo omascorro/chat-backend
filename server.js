@@ -489,6 +489,29 @@ wss.on('close', () => {
   clearInterval(failedAuthCleanupInterval);
 });
 
+// Apagado ordenado: Render manda SIGTERM al redeployar. Se avisa a los telefonos con codigo 1001 (la app se reconecta sola),
+// se deja de aceptar conexiones y se cierra el pool de la BD. Si algo se atora, se fuerza la salida a los 5 segundos.
+let isShuttingDown = false;
+async function shutdown(reason, exitCode) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`Apagando el servidor (${reason})...`);
+  setTimeout(() => process.exit(exitCode), 5000);
+
+  try {
+    for (const socket of wss.clients) socket.close(1001, 'Servidor reiniciando');
+    wss.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+    await pool.end();
+  } catch (err) {
+    console.log('Error durante el apagado:', err.message);
+  }
+  process.exit(exitCode);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+process.on('SIGINT', () => shutdown('SIGINT', 0));
+
 wss.on('error', (err) => {
   console.log('Error en el servidor de WebSockets (se ignora para no tumbar el servidor):', err.message);
 });
