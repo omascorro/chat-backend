@@ -182,10 +182,15 @@ wss.on('connection', (socket) => {
         const passwordHash = bcrypt.hashSync(password, 10);
         const recoveryCode = crypto.randomBytes(6).toString('hex').toUpperCase();
         const recoveryCodeHash = bcrypt.hashSync(recoveryCode, 10);
-        await pool.query(
-          'INSERT INTO users (username, password_hash, public_key, recovery_code_hash) VALUES ($1, $2, $3, $4)',
+        // ON CONFLICT cubre el caso de dos registros con el mismo nombre al mismo tiempo
+        const inserted = await pool.query(
+          'INSERT INTO users (username, password_hash, public_key, recovery_code_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (username) DO NOTHING RETURNING username',
           [username, passwordHash, publicKey, recoveryCodeHash]
         );
+        if (inserted.rows.length === 0) {
+          socket.send(JSON.stringify({ type: 'register-result', success: false, error: 'Ese nombre de usuario ya existe' }));
+          return;
+        }
         console.log(`Nueva cuenta registrada: ${username}`);
         socket.send(JSON.stringify({ type: 'register-result', success: true, recoveryCode }));
         return;
