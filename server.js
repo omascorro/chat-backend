@@ -491,6 +491,8 @@ initDatabase()
     });
   })
   .catch((err) => {
-    console.error('Error inicializando la base de datos:', err);
+    // Sin base de datos el servidor no sirve; se sale para que la plataforma lo reinicie en vez de quedar vivo sin escuchar
+    console.error('Error inicializando la base de datos, se cierra el proceso para que se reinicie:', err);
+    process.exit(1);
   });
   
