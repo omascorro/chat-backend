@@ -20,10 +20,14 @@ process.on('unhandledRejection', (err) => {
   console.log('Promesa rechazada sin atrapar en algun lado (se ignora para no tumbar el servidor):', err && err.message ? err.message : err);
 });
 
+// Con DB_CA_CERT (el certificado de Supabase) se verifica que la base de datos sea realmente Supabase.
+// Sin esa variable la conexion sigue cifrada pero sin verificar el certificado, como antes.
+const DB_CA_CERT = process.env.DB_CA_CERT ? process.env.DB_CA_CERT.replace(/\\n/g, '\n') : null;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: DB_CA_CERT ? { ca: DB_CA_CERT, rejectUnauthorized: true } : { rejectUnauthorized: false },
 });
+console.log(DB_CA_CERT ? 'Conexion a la base de datos con certificado verificado' : 'Aviso: la conexion a la base de datos no verifica el certificado (falta DB_CA_CERT)');
 
 pool.on('error', (err) => {
   console.log('Error inesperado en la conexion a la base de datos (se ignora para no tumbar el servidor):', err.message);
