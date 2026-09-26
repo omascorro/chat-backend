@@ -189,8 +189,96 @@ async function createAuthSession(username) {
 }
 
 const http = require('http');
+const { Readable } = require('stream');
+
+// Los archivos cifrados pasan por este servidor en vez de ir directo a Supabase desde el telefono:
+// algunas redes bloquean *.supabase.co, y asi los buckets pueden ser privados.
+const MEDIA_ROUTE_REGEX = /^\/media\/(videos|voices)\/([a-f0-9]{32}\.bin)$/;
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
+
+async function authenticateHttp(req) {
+  const username = req.headers['x-username'];
+  const auth = req.headers.authorization;
+  if (typeof username !== 'string' || typeof auth !== 'string' || !auth.startsWith('Bearer ')) return null;
+  const token = auth.slice(7);
+  if (!isNonEmptyString(username, 200) || !isNonEmptyString(token, 200)) return null;
+  const session = await pool.query('SELECT username FROM auth_sessions WHERE token_hash = $1 AND username = $2', [hashToken(token), username]);
+  return session.rows.length > 0 ? username : null;
+}
+
+async function handleMediaRequest(req, res, bucket, path) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    res.writeHead(503).end('Almacenamiento no configurado');
+    return;
+  }
+  const clientIp = getClientIp(req);
+  if (isAuthBlocked(`ip:${clientIp}`, FAILED_AUTH_LIMIT_PER_IP)) {
+    res.writeHead(429).end(TOO_MANY_ATTEMPTS_ERROR);
+    return;
+  }
+  const username = await authenticateHttp(req);
+  if (!username) {
+    recordFailedAuth(`ip:${clientIp}`, FAILED_AUTH_LIMIT_PER_IP);
+    res.writeHead(401).end('Sesion invalida');
+    return;
+  }
+
+  if (req.method === 'PUT' || req.method === 'POST') {
+    // Si el telefono manda el tamaño se valida aqui; si sube en partes, el limite del bucket (50 MB) lo frena en Supabase
+    const declaredHeader = req.headers['content-length'];
+    const declared = declaredHeader === undefined ? null : Number(declaredHeader);
+    if (declared !== null && (!Number.isFinite(declared) || declared <= 0 || declared > MAX_MEDIA_BYTES)) {
+      res.writeHead(413).end('Archivo demasiado grande');
+      return;
+    }
+    const upstream = await fetch(`${SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, {
+      method: 'POST',
+      headers: {
+        ...supabaseHeaders(),
+        'Content-Type': 'application/octet-stream',
+        'x-upsert': 'false',
+        ...(declared ? { 'Content-Length': String(declared) } : {}),
+      },
+      body: Readable.toWeb(req),
+      duplex: 'half',
+    });
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => '');
+      console.log(`Supabase rechazo la subida de ${username}: HTTP ${upstream.status} ${detail.slice(0, 200)}`);
+      res.writeHead(502).end(`Supabase HTTP ${upstream.status}`);
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ path }));
+    return;
+  }
+
+  if (req.method === 'GET') {
+    const upstream = await fetch(`${SUPABASE_URL}/storage/v1/object/authenticated/${bucket}/${path}`, { headers: supabaseHeaders() });
+    if (!upstream.ok || !upstream.body) {
+      res.writeHead(upstream.status === 400 || upstream.status === 404 ? 404 : 502).end('No disponible');
+      return;
+    }
+    const headers = { 'Content-Type': 'application/octet-stream' };
+    const length = upstream.headers.get('content-length');
+    if (length) headers['Content-Length'] = length;
+    res.writeHead(200, headers);
+    Readable.fromWeb(upstream.body).on('error', () => res.destroy()).pipe(res);
+    return;
+  }
+
+  res.writeHead(405).end();
+}
 
 const httpServer = http.createServer((req, res) => {
+  const match = MEDIA_ROUTE_REGEX.exec((req.url || '').split('?')[0]);
+  if (match) {
+    handleMediaRequest(req, res, match[1], match[2]).catch((err) => {
+      console.log('Error en una transferencia de archivo:', err.message);
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Servidor de chat activo');
 });
