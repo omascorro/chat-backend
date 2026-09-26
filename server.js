@@ -49,6 +49,34 @@ async function initDatabase() {
   console.log('Tablas verificadas/creadas en la base de datos');
 }
 
+const USERNAME_MIN_LENGTH = 3;
+const USERNAME_MAX_LENGTH = 30;
+const PASSWORD_MIN_LENGTH = 6;
+const PASSWORD_MAX_LENGTH = 72; // bcrypt ignora todo despues de 72 bytes
+
+function isNonEmptyString(value, maxLength) {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+}
+
+// Reglas estrictas solo para cuentas nuevas; las cuentas existentes siguen funcionando igual
+function validateNewUsername(username) {
+  if (typeof username !== 'string') return 'Nombre de usuario invalido';
+  if (username.trim() !== username) return 'El nombre de usuario no puede empezar ni terminar con espacios';
+  if (username.length < USERNAME_MIN_LENGTH || username.length > USERNAME_MAX_LENGTH) {
+    return `El nombre de usuario debe tener entre ${USERNAME_MIN_LENGTH} y ${USERNAME_MAX_LENGTH} caracteres`;
+  }
+  if (/[\u0000-\u001f\u007f]/.test(username)) return 'El nombre de usuario tiene caracteres no permitidos';
+  return null;
+}
+
+function validateNewPassword(password) {
+  if (typeof password !== 'string' || password.length < PASSWORD_MIN_LENGTH) {
+    return `La contraseña debe tener al menos ${PASSWORD_MIN_LENGTH} caracteres`;
+  }
+  if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_LENGTH) return 'La contraseña es demasiado larga';
+  return null;
+}
+
 const http = require('http');
 
 const httpServer = http.createServer((req, res) => {
@@ -138,6 +166,13 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'register') {
         const { username, password, publicKey } = parsed;
 
+        const validationError = validateNewUsername(username) || validateNewPassword(password)
+          || (isNonEmptyString(publicKey, 200) ? null : 'Llave publica invalida');
+        if (validationError) {
+          socket.send(JSON.stringify({ type: 'register-result', success: false, error: validationError }));
+          return;
+        }
+
         const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
         if (existing.rows.length > 0) {
           socket.send(JSON.stringify({ type: 'register-result', success: false, error: 'Ese nombre de usuario ya existe' }));
@@ -158,6 +193,17 @@ wss.on('connection', (socket) => {
 
       if (parsed.type === 'reset-password') {
         const { username, recoveryCode, newPassword } = parsed;
+
+        if (!isNonEmptyString(username, 200) || !isNonEmptyString(recoveryCode, 100)) {
+          socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: 'Usuario o código de recuperación incorrectos' }));
+          return;
+        }
+        const passwordError = validateNewPassword(newPassword);
+        if (passwordError) {
+          socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: passwordError }));
+          return;
+        }
+
         const result = await pool.query('SELECT recovery_code_hash FROM users WHERE username = $1', [username]);
         const row = result.rows[0];
 
@@ -175,6 +221,15 @@ wss.on('connection', (socket) => {
 
       if (parsed.type === 'login') {
         const { username, password, publicKey } = parsed;
+
+        if (!isNonEmptyString(username, 200) || !isNonEmptyString(password, 1000)) {
+          socket.send(JSON.stringify({ type: 'login-result', success: false, error: 'Usuario o contraseña incorrectos' }));
+          return;
+        }
+        if (!isNonEmptyString(publicKey, 200)) {
+          socket.send(JSON.stringify({ type: 'login-result', success: false, error: 'Llave publica invalida' }));
+          return;
+        }
 
         const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         const user = result.rows[0];
@@ -225,7 +280,7 @@ wss.on('connection', (socket) => {
       }
 
       if (parsed.type === 'register-push-token') {
-        if (myUsername) {
+        if (myUsername && isNonEmptyString(parsed.token, 500)) {
           await pool.query('UPDATE users SET push_token = $1 WHERE username = $2', [parsed.token, myUsername]);
           console.log(`Token de notificaciones guardado para ${myUsername}`);
         }
@@ -233,7 +288,7 @@ wss.on('connection', (socket) => {
       }
 
       if (parsed.type === 'update-profile-picture') {
-        if (myUsername) {
+        if (myUsername && typeof parsed.profilePicture === 'string') {
           await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [parsed.profilePicture, myUsername]);
           console.log(`Foto de perfil actualizada para ${myUsername}`);
           await broadcastUserList();
@@ -256,6 +311,14 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'direct-message') {
         if (!myUsername) return;
 
+        const hasValidCounter = parsed.counter === undefined || parsed.counter === null
+          || (Number.isInteger(parsed.counter) && parsed.counter >= 0 && parsed.counter <= 2147483647);
+        if (!isNonEmptyString(parsed.to, 200) || !isNonEmptyString(parsed.ciphertext, 1000000)
+          || !isNonEmptyString(parsed.nonce, 200) || !hasValidCounter) {
+          console.log(`Mensaje directo invalido de ${myUsername}, se descarta`);
+          return;
+        }
+
         const userResult = await pool.query('SELECT public_key FROM users WHERE username = $1', [myUsername]);
         const fromPublicKey = userResult.rows[0]?.public_key || null;
 
@@ -273,6 +336,11 @@ wss.on('connection', (socket) => {
           recipient.socket.send(JSON.stringify(payload));
           console.log(`Mensaje entregado: ${myUsername} -> ${parsed.to}`);
         } else {
+          const recipientExists = await pool.query('SELECT 1 FROM users WHERE username = $1', [parsed.to]);
+          if (recipientExists.rows.length === 0) {
+            console.log(`${myUsername} intento mandar un mensaje a ${parsed.to}, que no existe; se descarta`);
+            return;
+          }
           await pool.query(
             'INSERT INTO pending_messages (to_username, from_username, from_public_key, ciphertext, nonce, counter) VALUES ($1, $2, $3, $4, $5, $6)',
             [parsed.to, myUsername, fromPublicKey, parsed.ciphertext, parsed.nonce, parsed.counter]
