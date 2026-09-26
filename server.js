@@ -23,8 +23,22 @@ process.on('unhandledRejection', (err) => {
 // Con DB_CA_CERT (el certificado de Supabase) se verifica que la base de datos sea realmente Supabase.
 // Sin esa variable la conexion sigue cifrada pero sin verificar el certificado, como antes.
 const DB_CA_CERT = process.env.DB_CA_CERT ? process.env.DB_CA_CERT.replace(/\\n/g, '\n') : null;
+
+// Si DATABASE_URL trae sslmode, pg lo usaria en lugar de la configuracion de abajo; con certificado se quita
+function databaseUrl() {
+  const raw = process.env.DATABASE_URL;
+  if (!DB_CA_CERT || !raw) return raw;
+  try {
+    const url = new URL(raw);
+    for (const param of ['sslmode', 'sslrootcert', 'sslcert', 'sslkey']) url.searchParams.delete(param);
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl(),
   ssl: DB_CA_CERT ? { ca: DB_CA_CERT, rejectUnauthorized: true } : { rejectUnauthorized: false },
 });
 console.log(DB_CA_CERT ? 'Conexion a la base de datos con certificado verificado' : 'Aviso: la conexion a la base de datos no verifica el certificado (falta DB_CA_CERT)');
