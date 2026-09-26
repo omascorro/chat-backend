@@ -87,14 +87,29 @@ const httpServer = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 const onlineUsers = new Map(); // username -> { socket, publicKey }
 
-async function broadcastUserList() {
+// Copia en memoria de los usuarios, para no leer toda la tabla (con fotos) en cada broadcast.
+// Este servidor es el unico que escribe en la tabla users, asi que se mantiene al dia actualizandola junto con la BD.
+const knownUsers = new Map(); // username -> { publicKey, profilePicture }
+
+async function loadKnownUsers() {
   const result = await pool.query('SELECT username, public_key, profile_picture FROM users');
-  const list = result.rows.map((row) => ({
-    username: row.username,
-    publicKey: row.public_key,
-    profilePicture: row.profile_picture,
-    online: onlineUsers.has(row.username),
-  }));
+  knownUsers.clear();
+  for (const row of result.rows) {
+    knownUsers.set(row.username, { publicKey: row.public_key, profilePicture: row.profile_picture });
+  }
+  console.log(`${knownUsers.size} usuario(s) cargados en memoria`);
+}
+
+function broadcastUserList() {
+  const list = [];
+  for (const [username, info] of knownUsers) {
+    list.push({
+      username,
+      publicKey: info.publicKey,
+      profilePicture: info.profilePicture,
+      online: onlineUsers.has(username),
+    });
+  }
   const payload = JSON.stringify({ type: 'user-list', users: list });
   for (const [, info] of onlineUsers) {
     if (info.socket.readyState === info.socket.OPEN) info.socket.send(payload);
@@ -191,6 +206,7 @@ wss.on('connection', (socket) => {
           socket.send(JSON.stringify({ type: 'register-result', success: false, error: 'Ese nombre de usuario ya existe' }));
           return;
         }
+        knownUsers.set(username, { publicKey, profilePicture: null });
         console.log(`Nueva cuenta registrada: ${username}`);
         socket.send(JSON.stringify({ type: 'register-result', success: true, recoveryCode }));
         return;
@@ -245,6 +261,7 @@ wss.on('connection', (socket) => {
         }
 
         await pool.query('UPDATE users SET public_key = $1 WHERE username = $2', [publicKey, username]);
+        knownUsers.set(username, { publicKey, profilePicture: user.profile_picture });
 
         myUsername = username;
         const previousConnection = onlineUsers.get(username);
@@ -254,7 +271,7 @@ wss.on('connection', (socket) => {
         }
         onlineUsers.set(username, { socket, publicKey });
         socket.send(JSON.stringify({ type: 'login-result', success: true }));
-        await broadcastUserList();
+        broadcastUserList();
         console.log(`${username} inició sesión`);
 
         const pendingResult = await pool.query(
@@ -295,8 +312,10 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'update-profile-picture') {
         if (myUsername && typeof parsed.profilePicture === 'string') {
           await pool.query('UPDATE users SET profile_picture = $1 WHERE username = $2', [parsed.profilePicture, myUsername]);
+          const known = knownUsers.get(myUsername);
+          if (known) known.profilePicture = parsed.profilePicture;
           console.log(`Foto de perfil actualizada para ${myUsername}`);
-          await broadcastUserList();
+          broadcastUserList();
         }
         return;
       }
@@ -367,7 +386,7 @@ wss.on('connection', (socket) => {
         if (current && current.socket === socket) {
           onlineUsers.delete(myUsername);
           console.log(`${myUsername} se desconecto`);
-          await broadcastUserList();
+          broadcastUserList();
         } else {
           console.log(`Se cerro una conexion vieja de ${myUsername} que ya habia sido reemplazada por una nueva, no se hace nada`);
         }
@@ -390,7 +409,11 @@ const heartbeatInterval = setInterval(() => {
 }, HEARTBEAT_INTERVAL_MS);
 
 const userListRefreshInterval = setInterval(() => {
-  broadcastUserList().catch((e) => console.log('Error actualizando la lista de usuarios en el intervalo:', e.message));
+  try {
+    broadcastUserList();
+  } catch (e) {
+    console.log('Error actualizando la lista de usuarios en el intervalo:', e.message);
+  }
 }, 15000);
 
 wss.on('close', () => {
@@ -403,6 +426,7 @@ wss.on('error', (err) => {
 });
 
 initDatabase()
+  .then(loadKnownUsers)
   .then(() => {
     httpServer.listen(PORT, () => {
       console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
