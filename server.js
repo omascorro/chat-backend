@@ -154,6 +154,14 @@ function broadcastUserList() {
   }
 }
 
+// Si Expo dice que el dispositivo ya no existe (app desinstalada, etc.), se borra el token para no seguir mandandole.
+// Solo se borra si sigue siendo el mismo token, por si el usuario ya registro uno nuevo mientras tanto.
+async function clearPushTokenIfUnregistered(username, pushToken, pushResult) {
+  if (!pushResult || pushResult.status !== 'error' || pushResult.details?.error !== 'DeviceNotRegistered') return;
+  await pool.query('UPDATE users SET push_token = NULL WHERE username = $1 AND push_token = $2', [username, pushToken]);
+  console.log(`Token de notificaciones de ${username} ya no es valido, se borro`);
+}
+
 async function sendPushNotification(toUsername, fromUsername) {
   const result = await pool.query('SELECT push_token FROM users WHERE username = $1', [toUsername]);
   const pushToken = result.rows[0]?.push_token;
@@ -173,6 +181,7 @@ async function sendPushNotification(toUsername, fromUsername) {
     });
     const result2 = await response.json();
     console.log('Respuesta de Expo Push:', JSON.stringify(result2));
+    await clearPushTokenIfUnregistered(toUsername, pushToken, result2.data);
 
     if (result2.data && result2.data.id) {
       const ticketId = result2.data.id;
@@ -185,6 +194,7 @@ async function sendPushNotification(toUsername, fromUsername) {
           });
           const receiptData = await receiptRes.json();
           console.log('Recibo de entrega:', JSON.stringify(receiptData));
+          await clearPushTokenIfUnregistered(toUsername, pushToken, receiptData.data?.[ticketId]);
         } catch (e) {
           console.log('Error obteniendo recibo:', e.message);
         }
