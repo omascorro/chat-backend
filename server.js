@@ -234,9 +234,9 @@ wss.on('connection', (socket, req) => {
           return;
         }
 
-        const passwordHash = bcrypt.hashSync(password, 10);
+        const passwordHash = await bcrypt.hash(password, 10);
         const recoveryCode = crypto.randomBytes(6).toString('hex').toUpperCase();
-        const recoveryCodeHash = bcrypt.hashSync(recoveryCode, 10);
+        const recoveryCodeHash = await bcrypt.hash(recoveryCode, 10);
         // ON CONFLICT cubre el caso de dos registros con el mismo nombre al mismo tiempo
         const inserted = await pool.query(
           'INSERT INTO users (username, password_hash, public_key, recovery_code_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (username) DO NOTHING RETURNING username',
@@ -272,13 +272,13 @@ wss.on('connection', (socket, req) => {
         const result = await pool.query('SELECT recovery_code_hash FROM users WHERE username = $1', [username]);
         const row = result.rows[0];
 
-        if (!row || !row.recovery_code_hash || !bcrypt.compareSync(recoveryCode, row.recovery_code_hash)) {
+        if (!row || !row.recovery_code_hash || !(await bcrypt.compare(recoveryCode, row.recovery_code_hash))) {
           recordFailedAuth(clientIp);
           socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: 'Usuario o código de recuperación incorrectos' }));
           return;
         }
 
-        const newHash = bcrypt.hashSync(newPassword, 10);
+        const newHash = await bcrypt.hash(newPassword, 10);
         await pool.query('UPDATE users SET password_hash = $1 WHERE username = $2', [newHash, username]);
         console.log(`Contraseña restablecida para ${username}`);
         socket.send(JSON.stringify({ type: 'reset-password-result', success: true }));
@@ -304,7 +304,7 @@ wss.on('connection', (socket, req) => {
         const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         const user = result.rows[0];
 
-        if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
           recordFailedAuth(clientIp);
           socket.send(JSON.stringify({ type: 'login-result', success: false, error: 'Usuario o contraseña incorrectos' }));
           return;
