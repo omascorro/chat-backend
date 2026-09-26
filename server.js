@@ -77,6 +77,41 @@ function validateNewPassword(password) {
   return null;
 }
 
+// Limite de intentos fallidos de login / reset por IP, para frenar ataques de fuerza bruta.
+// Solo cuentan los fallos, asi que la reconexion automatica de la app con la contraseña correcta nunca se bloquea.
+const FAILED_AUTH_LIMIT = 20;
+const FAILED_AUTH_WINDOW_MS = 15 * 60 * 1000;
+const failedAuthAttempts = new Map(); // ip -> { count, firstAttemptAt }
+
+function isAuthBlocked(ip) {
+  const entry = failedAuthAttempts.get(ip);
+  if (!entry) return false;
+  if (Date.now() - entry.firstAttemptAt > FAILED_AUTH_WINDOW_MS) {
+    failedAuthAttempts.delete(ip);
+    return false;
+  }
+  return entry.count >= FAILED_AUTH_LIMIT;
+}
+
+function recordFailedAuth(ip) {
+  const entry = failedAuthAttempts.get(ip);
+  if (!entry || Date.now() - entry.firstAttemptAt > FAILED_AUTH_WINDOW_MS) {
+    failedAuthAttempts.set(ip, { count: 1, firstAttemptAt: Date.now() });
+  } else {
+    entry.count += 1;
+    if (entry.count === FAILED_AUTH_LIMIT) console.log(`Demasiados intentos fallidos desde ${ip}, se bloquea temporalmente`);
+  }
+}
+
+function getClientIp(req) {
+  // Render pone la IP real del cliente en x-forwarded-for
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || 'desconocida';
+}
+
+const TOO_MANY_ATTEMPTS_ERROR = 'Demasiados intentos fallidos, espera unos minutos';
+
 const http = require('http');
 
 const httpServer = http.createServer((req, res) => {
@@ -157,8 +192,9 @@ async function sendPushNotification(toUsername, fromUsername) {
   }
 }
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, req) => {
   let myUsername = null;
+  const clientIp = getClientIp(req);
 
   socket.isAlive = true;
   socket.on('pong', () => {
@@ -215,6 +251,10 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'reset-password') {
         const { username, recoveryCode, newPassword } = parsed;
 
+        if (isAuthBlocked(clientIp)) {
+          socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: TOO_MANY_ATTEMPTS_ERROR }));
+          return;
+        }
         if (!isNonEmptyString(username, 200) || !isNonEmptyString(recoveryCode, 100)) {
           socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: 'Usuario o código de recuperación incorrectos' }));
           return;
@@ -229,6 +269,7 @@ wss.on('connection', (socket) => {
         const row = result.rows[0];
 
         if (!row || !row.recovery_code_hash || !bcrypt.compareSync(recoveryCode, row.recovery_code_hash)) {
+          recordFailedAuth(clientIp);
           socket.send(JSON.stringify({ type: 'reset-password-result', success: false, error: 'Usuario o código de recuperación incorrectos' }));
           return;
         }
@@ -243,6 +284,10 @@ wss.on('connection', (socket) => {
       if (parsed.type === 'login') {
         const { username, password, publicKey } = parsed;
 
+        if (isAuthBlocked(clientIp)) {
+          socket.send(JSON.stringify({ type: 'login-result', success: false, error: TOO_MANY_ATTEMPTS_ERROR }));
+          return;
+        }
         if (!isNonEmptyString(username, 200) || !isNonEmptyString(password, 1000)) {
           socket.send(JSON.stringify({ type: 'login-result', success: false, error: 'Usuario o contraseña incorrectos' }));
           return;
@@ -256,6 +301,7 @@ wss.on('connection', (socket) => {
         const user = result.rows[0];
 
         if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+          recordFailedAuth(clientIp);
           socket.send(JSON.stringify({ type: 'login-result', success: false, error: 'Usuario o contraseña incorrectos' }));
           return;
         }
@@ -416,9 +462,17 @@ const userListRefreshInterval = setInterval(() => {
   }
 }, 15000);
 
+const failedAuthCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of failedAuthAttempts) {
+    if (now - entry.firstAttemptAt > FAILED_AUTH_WINDOW_MS) failedAuthAttempts.delete(ip);
+  }
+}, FAILED_AUTH_WINDOW_MS);
+
 wss.on('close', () => {
   clearInterval(heartbeatInterval);
   clearInterval(userListRefreshInterval);
+  clearInterval(failedAuthCleanupInterval);
 });
 
 wss.on('error', (err) => {
