@@ -376,7 +376,8 @@ function sendUserList(username) {
   for (const contact of contactsOf.get(username) || []) {
     const info = knownUsers.get(contact);
     if (!info) continue;
-    users.push({ username: contact, profilePicture: info.profilePicture, identity: info.identity, online: onlineUsers.has(contact) });
+    const presence = onlineUsers.get(contact);
+    users.push({ username: contact, profilePicture: info.profilePicture, identity: info.identity, online: !!presence && presence.active });
   }
   sendJson(online.socket, { type: 'user-list', users, me: { username, profilePicture: me?.profilePicture || null } });
 }
@@ -401,6 +402,15 @@ async function clearPushTokenIfUnregistered(username, pushToken, pushResult) {
 }
 
 // La notificacion no dice quien escribio: Expo, Apple y Google no tienen por que saber quien habla con quien
+// Deja en los logs por que no llego una notificacion (ej. InvalidCredentials si falta la llave de Apple en Expo)
+function logPushProblem(username, stage, result, errors) {
+  if (Array.isArray(errors) && errors.length > 0) {
+    console.log(`Notificacion para ${username} (${stage}) fallo: ${errors.map((e) => e.message || e.code).join('; ')}`);
+  } else if (result && result.status === 'error') {
+    console.log(`Notificacion para ${username} (${stage}) fallo: ${result.details?.error || ''} ${result.message || ''}`.trim());
+  }
+}
+
 async function sendPushNotification(toUsername) {
   const result = await pool.query('SELECT push_token FROM users WHERE username = $1', [toUsername]);
   const pushToken = result.rows[0]?.push_token;
@@ -416,9 +426,12 @@ async function sendPushNotification(toUsername) {
         body: 'Tienes un mensaje nuevo',
         sound: 'default',
         channelId: 'default',
+        // Alta prioridad para que Android la entregue aunque el telefono este en reposo
+        priority: 'high',
       }),
     });
     const pushResponse = await response.json();
+    logPushProblem(toUsername, 'envio', pushResponse.data, pushResponse.errors);
     await clearPushTokenIfUnregistered(toUsername, pushToken, pushResponse.data);
 
     if (pushResponse.data && pushResponse.data.id) {
@@ -431,6 +444,7 @@ async function sendPushNotification(toUsername) {
             body: JSON.stringify({ ids: [ticketId] }),
           });
           const receiptData = await receiptRes.json();
+          logPushProblem(toUsername, 'entrega', receiptData.data?.[ticketId], receiptData.errors);
           await clearPushTokenIfUnregistered(toUsername, pushToken, receiptData.data?.[ticketId]);
         } catch (e) {
           console.log('Error obteniendo recibo de push:', e.message);
@@ -512,7 +526,8 @@ wss.on('connection', (socket, req) => {
       console.log(`${username} ya tenia una conexion vieja abierta, cerrandola porque acaba de entrar con una nueva`);
       previousConnection.socket.terminate();
     }
-    onlineUsers.set(username, { socket, tokenHash });
+    // active: la app esta en primer plano. Las versiones que no mandan "presence" cuentan como activas.
+    onlineUsers.set(username, { socket, tokenHash, active: true });
     sendUserList(username);
     notifyWatchers(username);
 
@@ -743,6 +758,17 @@ wss.on('connection', (socket, req) => {
         return;
       }
 
+      // La app avisa si esta en primer plano o no, para saber cuando mandar notificaciones
+      if (parsed.type === 'presence') {
+        const entry = onlineUsers.get(myUsername);
+        const active = parsed.state === 'active';
+        if (entry && entry.socket === socket && entry.active !== active) {
+          entry.active = active;
+          notifyWatchers(myUsername);
+        }
+        return;
+      }
+
       if (parsed.type === 'register-push-token') {
         if (isNonEmptyString(parsed.token, 500)) {
           await pool.query('UPDATE users SET push_token = $1 WHERE username = $2', [parsed.token, myUsername]);
@@ -795,9 +821,12 @@ wss.on('connection', (socket, req) => {
         if (await addContact(to, myUsername)) sendUserList(to);
 
         const recipient = onlineUsers.get(to);
-        if (recipient && recipient.socket.readyState === recipient.socket.OPEN) {
+        const connected = recipient && recipient.socket.readyState === recipient.socket.OPEN;
+        if (connected) {
           sendJson(recipient.socket, { type: 'message', id, from: myUsername, envelope: JSON.parse(envelopeJson) });
-        } else if (!silent) {
+        }
+        // Con el telefono bloqueado o la app en segundo plano la conexion puede seguir viva un rato; igual se avisa
+        if (!silent && (!connected || !recipient.active)) {
           await sendPushNotification(to);
         }
         return;
