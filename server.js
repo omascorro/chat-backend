@@ -369,6 +369,7 @@ wss.on('connection', (socket, req) => {
       }
 
       if (parsed.type === 'read-receipt') {
+        if (!myUsername) return;
         const recipient = onlineUsers.get(parsed.to);
         if (recipient && recipient.socket.readyState === recipient.socket.OPEN) {
           recipient.socket.send(JSON.stringify({
