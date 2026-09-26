@@ -1,0 +1,11 @@
+name: Mantener despierto el servidor
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - run: curl -fsS -m 90 https://chat-backend-p5ny.onrender.com > /dev/null || echo "sin respuesta"
