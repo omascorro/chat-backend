@@ -119,7 +119,9 @@ const httpServer = http.createServer((req, res) => {
   res.end('Servidor de chat activo');
 });
 
-const wss = new WebSocketServer({ server: httpServer });
+// La foto de perfil viaja en base64 por aqui, por eso el limite es generoso; el default de ws (100 MB) es demasiado
+const MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
+const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_MESSAGE_BYTES });
 const onlineUsers = new Map(); // username -> { socket, publicKey }
 
 // Copia en memoria de los usuarios, para no leer toda la tabla (con fotos) en cada broadcast.
