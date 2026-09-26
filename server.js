@@ -450,6 +450,12 @@ wss.on('connection', (socket, req) => {
     }
     if (!parsed || typeof parsed.type !== 'string') return;
 
+    // La app pregunta si la conexion sigue viva antes de decidir si reconecta
+    if (parsed.type === 'ping') {
+      sendJson(socket, { type: 'pong', id: typeof parsed.id === 'string' ? parsed.id.slice(0, 64) : null });
+      return;
+    }
+
     try {
       if (parsed.type === 'register') {
         if (parsed.v !== PROTOCOL_VERSION) return rejectOldClient('register-result');
