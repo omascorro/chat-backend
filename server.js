@@ -522,6 +522,11 @@ wss.on('error', (err) => {
 initDatabase()
   .then(loadKnownUsers)
   .then(() => {
+    // Si no se puede abrir el puerto, salir: si no, el proceso quedaria vivo sin escuchar
+    httpServer.once('error', (err) => {
+      console.error('No se pudo abrir el puerto, se cierra el proceso para que se reinicie:', err.message);
+      process.exit(1);
+    });
     httpServer.listen(PORT, () => {
       console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
     });
