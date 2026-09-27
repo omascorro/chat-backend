@@ -776,6 +776,21 @@ wss.on('connection', (socket, req) => {
         return;
       }
 
+      // "Escribiendo..." / "grabando audio...": solo se reenvia al momento entre contactos, nunca se guarda
+      if (parsed.type === 'typing') {
+        const { to } = parsed;
+        const now = Date.now();
+        if (!isNonEmptyString(to, 200) || now - (socket.lastTypingAt || 0) < 400) return;
+        socket.lastTypingAt = now;
+        const areContacts = contactsOf.get(myUsername)?.has(to) || contactsOf.get(to)?.has(myUsername);
+        const recipient = onlineUsers.get(to);
+        if (areContacts && recipient && recipient.active) {
+          const state = ['start', 'recording', 'stop'].includes(parsed.state) ? parsed.state : 'start';
+          sendJson(recipient.socket, { type: 'typing', from: myUsername, state });
+        }
+        return;
+      }
+
       // La app avisa si esta en primer plano o no, para saber cuando mandar notificaciones
       if (parsed.type === 'presence') {
         const entry = onlineUsers.get(myUsername);
