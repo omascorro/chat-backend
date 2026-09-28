@@ -98,6 +98,17 @@ async function initDatabase() {
     );
   `);
   await pool.query(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);`);
+  // Quien subio cada archivo y para quien: solo esos dos pueden bajarlo o borrarlo
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS media_objects (
+      bucket TEXT NOT NULL,
+      path TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      recipient TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (bucket, path)
+    );
+  `);
 
   // Una sola vez: antes todos veian a todos, asi que los usuarios que ya existian quedan como contactos entre si
   const seeded = await pool.query(`INSERT INTO meta (key, value) VALUES ('contacts_seeded', '1') ON CONFLICT (key) DO NOTHING RETURNING key`);
@@ -227,6 +238,13 @@ async function authenticateHttp(req) {
   return session.rows.length > 0 ? username : null;
 }
 
+// Archivos de antes de este registro (sin fila) siguen accesibles para cualquier sesion, como antes
+async function canAccessMedia(bucket, path, username) {
+  const row = (await pool.query('SELECT owner, recipient FROM media_objects WHERE bucket = $1 AND path = $2', [bucket, path])).rows[0];
+  if (!row || !row.recipient) return true;
+  return username === row.owner || username === row.recipient;
+}
+
 async function handleMediaRequest(req, res, bucket, path) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     res.writeHead(503).end('Almacenamiento no configurado');
@@ -269,11 +287,22 @@ async function handleMediaRequest(req, res, bucket, path) {
       res.writeHead(502).end(`Supabase HTTP ${upstream.status}`);
       return;
     }
+    const recipientHeader = req.headers['x-recipient'];
+    const recipient = typeof recipientHeader === 'string' && knownUsers.has(recipientHeader) ? recipientHeader : null;
+    await pool.query(
+      'INSERT INTO media_objects (bucket, path, owner, recipient) VALUES ($1, $2, $3, $4) ON CONFLICT (bucket, path) DO NOTHING',
+      [bucket, path, username, recipient]
+    );
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ path }));
     return;
   }
 
   if (req.method === 'GET') {
+    // Si se sabe para quien era, solo el que lo subio y el destinatario lo pueden bajar (404 para los demas)
+    if (!(await canAccessMedia(bucket, path, username))) {
+      res.writeHead(404).end('No disponible');
+      return;
+    }
     const upstream = await fetch(`${SUPABASE_URL}/storage/v1/object/authenticated/${bucket}/${path}`, { headers: supabaseHeaders() });
     if (!upstream.ok || !upstream.body) {
       res.writeHead(upstream.status === 400 || upstream.status === 404 ? 404 : 502).end('No disponible');
@@ -351,6 +380,9 @@ async function addContact(owner, contact) {
 // Las fotos se reducen al tamaño del avatar de la app (40 pt, 120 px en pantallas 3x) para que cada una pese unos KB.
 const PROFILE_PICTURE_SIZE_PX = 160;
 const PROFILE_PICTURE_MAX_BASE64_LENGTH = 20000; // las que ya son mas chicas que esto no se tocan
+// Fotos cifradas en el telefono ("e1:" + base64): el servidor no las puede ver ni reducir, solo las guarda y reparte
+const ENCRYPTED_PICTURE_REGEX = /^e1:[A-Za-z0-9+/]+={0,2}$/;
+const ENCRYPTED_PICTURE_MAX_LENGTH = 80000;
 
 async function shrinkProfilePicture(base64) {
   const output = await sharp(Buffer.from(base64, 'base64'))
@@ -366,7 +398,7 @@ async function shrinkExistingProfilePictures() {
   let shrunk = 0;
   for (const [username, info] of knownUsers) {
     const original = info.profilePicture;
-    if (!original || original.length <= PROFILE_PICTURE_MAX_BASE64_LENGTH) continue;
+    if (!original || original.startsWith('e1:') || original.length <= PROFILE_PICTURE_MAX_BASE64_LENGTH) continue;
     try {
       const small = await shrinkProfilePicture(original);
       // Solo se reemplaza si nadie subio otra foto mientras tanto
@@ -838,7 +870,12 @@ wss.on('connection', (socket, req) => {
         if (typeof parsed.profilePicture === 'string') {
           let profilePicture;
           try {
-            profilePicture = await shrinkProfilePicture(parsed.profilePicture);
+            if (parsed.profilePicture.startsWith('e1:')) {
+              if (parsed.profilePicture.length > ENCRYPTED_PICTURE_MAX_LENGTH || !ENCRYPTED_PICTURE_REGEX.test(parsed.profilePicture)) throw new Error('foto cifrada invalida');
+              profilePicture = parsed.profilePicture;
+            } else {
+              profilePicture = await shrinkProfilePicture(parsed.profilePicture);
+            }
           } catch (err) {
             console.log(`La foto de perfil que mando ${myUsername} no es una imagen valida, se ignora:`, err.message);
             return;
@@ -902,8 +939,9 @@ wss.on('connection', (socket, req) => {
 
       if (parsed.type === 'media-done') {
         const { bucket, path } = parsed;
-        if (MEDIA_BUCKETS.includes(bucket) && typeof path === 'string' && MEDIA_PATH_REGEX.test(path)) {
+        if (MEDIA_BUCKETS.includes(bucket) && typeof path === 'string' && MEDIA_PATH_REGEX.test(path) && (await canAccessMedia(bucket, path, myUsername))) {
           await deleteMediaObjects(bucket, [path]);
+          await pool.query('DELETE FROM media_objects WHERE bucket = $1 AND path = $2', [bucket, path]);
         }
         return;
       }
@@ -957,6 +995,7 @@ const failedAuthCleanupInterval = setInterval(() => {
 async function periodicCleanup() {
   try {
     const inbox = await pool.query(`DELETE FROM inbox WHERE created_at < NOW() - INTERVAL '30 days'`);
+    await pool.query(`DELETE FROM media_objects WHERE created_at < NOW() - INTERVAL '15 days'`);
     const sessions = await pool.query(`DELETE FROM auth_sessions WHERE last_used_at < NOW() - INTERVAL '90 days'`);
     if (inbox.rowCount > 0 || sessions.rowCount > 0) {
       console.log(`Limpieza: ${inbox.rowCount} mensaje(s) viejos y ${sessions.rowCount} sesion(es) abandonadas borrados`);
