@@ -58,6 +58,9 @@ async function initDatabase() {
   `);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_code_hash TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT;`);
+  // Para armar la notificacion: iPhone o Android, y si la app ya sabe mostrar la vista previa cifrada
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS push_platform TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS push_previews BOOLEAN DEFAULT FALSE;`);
   // Protocolo v2: identidad (firma + DH) y prekey firmada para X3DH
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_sign_pub TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_dh_pub TEXT;`);
@@ -429,24 +432,41 @@ function logPushProblem(username, stage, result, errors) {
   }
 }
 
-async function sendPushNotification(toUsername) {
-  const result = await pool.query('SELECT push_token FROM users WHERE username = $1', [toUsername]);
-  const pushToken = result.rows[0]?.push_token;
+// Arma la notificacion segun el telefono que la recibe. `preview` es la vista previa cifrada con la llave del
+// destinatario: este servidor no la puede leer, solo la reenvia.
+function buildPushMessage(pushToken, platform, supportsPreviews, preview) {
+  const generic = {
+    to: pushToken,
+    title: 'Aeterna',
+    body: 'Tienes un mensaje nuevo',
+    sound: 'default',
+    channelId: 'default',
+    // Alta prioridad para que Android la entregue aunque el telefono este en reposo
+    priority: 'high',
+  };
+  if (!supportsPreviews) return generic;
+  if (platform === 'android') {
+    // Solo datos: la app la recibe en segundo plano, la descifra y la muestra ella misma
+    return { to: pushToken, data: { p: preview || '' }, priority: 'high' };
+  }
+  if (platform === 'ios' && preview) {
+    // mutableContent hace que la extension del iPhone la descifre antes de mostrarla (si falla, se ve la generica)
+    return { ...generic, mutableContent: true, data: { p: preview } };
+  }
+  return generic;
+}
+
+async function sendPushNotification(toUsername, preview) {
+  const result = await pool.query('SELECT push_token, push_platform, push_previews FROM users WHERE username = $1', [toUsername]);
+  const row = result.rows[0];
+  const pushToken = row?.push_token;
   if (!pushToken) return;
 
   try {
     const response = await fetch('https://exp.host/--/api/v2/push/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        to: pushToken,
-        title: 'Aeterna',
-        body: 'Tienes un mensaje nuevo',
-        sound: 'default',
-        channelId: 'default',
-        // Alta prioridad para que Android la entregue aunque el telefono este en reposo
-        priority: 'high',
-      }),
+      body: JSON.stringify(buildPushMessage(pushToken, row.push_platform, !!row.push_previews, preview)),
     });
     const pushResponse = await response.json();
     logPushProblem(toUsername, 'envio', pushResponse.data, pushResponse.errors);
@@ -804,7 +824,12 @@ wss.on('connection', (socket, req) => {
 
       if (parsed.type === 'register-push-token') {
         if (isNonEmptyString(parsed.token, 500)) {
-          await pool.query('UPDATE users SET push_token = $1 WHERE username = $2', [parsed.token, myUsername]);
+          // Las versiones anteriores no mandan platform/previews: siguen recibiendo la notificacion generica
+          const platform = parsed.platform === 'ios' || parsed.platform === 'android' ? parsed.platform : null;
+          await pool.query(
+            'UPDATE users SET push_token = $1, push_platform = $2, push_previews = $3 WHERE username = $4',
+            [parsed.token, platform, parsed.previews === true && !!platform, myUsername]
+          );
         }
         return;
       }
@@ -829,6 +854,8 @@ wss.on('connection', (socket, req) => {
 
       if (parsed.type === 'direct-message') {
         const { to, clientId, envelope, silent } = parsed;
+        // Vista previa cifrada para la notificacion (opcional); aqui no se puede leer
+        const preview = typeof parsed.preview === 'string' && /^[A-Za-z0-9+/=]{40,1200}$/.test(parsed.preview) ? parsed.preview : null;
         const validEnvelope = envelope && isNonEmptyString(envelope.h, 2000) && isNonEmptyString(envelope.c, MAX_ENVELOPE_LENGTH)
           && isNonEmptyString(envelope.nonce, 64);
         if (!isNonEmptyString(to, 200) || !isNonEmptyString(clientId, 100) || !validEnvelope) {
@@ -860,7 +887,7 @@ wss.on('connection', (socket, req) => {
         }
         // Con el telefono bloqueado o la app en segundo plano la conexion puede seguir viva un rato; igual se avisa
         if (!silent && (!connected || !recipient.active)) {
-          await sendPushNotification(to);
+          await sendPushNotification(to, preview);
         }
         return;
       }
