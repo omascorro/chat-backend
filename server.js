@@ -120,7 +120,25 @@ async function initDatabase() {
     `);
     console.log('Contactos iniciales creados a partir de los usuarios existentes');
   }
+  await lockDownTables();
   console.log('Tablas verificadas/creadas en la base de datos');
+}
+
+// Supabase publica las tablas de "public" en su API REST (anon/authenticated). Nadie debe usarla: todo pasa por este
+// servidor, que es el dueño de las tablas y por eso no le afecta RLS. RLS sin politicas + sin permisos = API cerrada.
+const APP_TABLES = ['users', 'inbox', 'auth_sessions', 'contacts', 'meta', 'media_objects'];
+
+async function lockDownTables() {
+  for (const table of APP_TABLES) {
+    for (const sql of [`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`, `REVOKE ALL ON TABLE ${table} FROM anon, authenticated`]) {
+      try {
+        await pool.query(sql);
+      } catch (err) {
+        // Fuera de Supabase (pruebas) no existen esos roles
+        if (!/role .* does not exist|not supported|syntax/i.test(err.message)) console.log(`No se pudo proteger la tabla ${table}:`, err.message);
+      }
+    }
+  }
 }
 
 const USERNAME_MIN_LENGTH = 3;
