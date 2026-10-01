@@ -506,41 +506,61 @@ function buildPushMessage(pushToken, platform, supportsPreviews, preview) {
   return generic;
 }
 
-async function sendPushNotification(toUsername, preview) {
+// Devuelve que paso (para la prueba de notificaciones de Ajustes). test: aviso de prueba que no depende de un mensaje.
+async function sendPushNotification(toUsername, preview, { test = false } = {}) {
   const result = await pool.query('SELECT push_token, push_platform, push_previews FROM users WHERE username = $1', [toUsername]);
   const row = result.rows[0];
   const pushToken = row?.push_token;
-  if (!pushToken) return;
+  if (!pushToken) {
+    console.log(`Notificacion para ${toUsername}: no hay token guardado (el telefono no lo ha registrado)`);
+    return { ok: false, stage: 'token', error: 'El servidor no tiene registrado este teléfono para notificaciones' };
+  }
+  const message = buildPushMessage(pushToken, row.push_platform, !!row.push_previews, preview);
+  if (test && message.title) message.body = 'Prueba de notificaciones ✅';
 
   try {
     const response = await fetch('https://exp.host/--/api/v2/push/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildPushMessage(pushToken, row.push_platform, !!row.push_previews, preview)),
+      body: JSON.stringify(message),
     });
     const pushResponse = await response.json();
     logPushProblem(toUsername, 'envio', pushResponse.data, pushResponse.errors);
     await clearPushTokenIfUnregistered(toUsername, pushToken, pushResponse.data);
-
-    if (pushResponse.data && pushResponse.data.id) {
-      const ticketId = pushResponse.data.id;
-      setTimeout(async () => {
-        try {
-          const receiptRes = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids: [ticketId] }),
-          });
-          const receiptData = await receiptRes.json();
-          logPushProblem(toUsername, 'entrega', receiptData.data?.[ticketId], receiptData.errors);
-          await clearPushTokenIfUnregistered(toUsername, pushToken, receiptData.data?.[ticketId]);
-        } catch (e) {
-          console.log('Error obteniendo recibo de push:', e.message);
-        }
-      }, 15000);
+    const ticketId = pushResponse.data?.status === 'ok' ? pushResponse.data.id : null;
+    if (!ticketId) {
+      const error = pushResponse.errors?.map((e) => e.message || e.code).join('; ') || pushResponse.data?.details?.error || pushResponse.data?.message || 'Expo rechazó la notificación';
+      return { ok: false, stage: 'envio', error };
     }
+    console.log(`Notificacion enviada a ${toUsername} (${row.push_platform || 'sin plataforma'}${row.push_previews ? ', con vista previa' : ''})`);
+    return { ok: true, ticketId, platform: row.push_platform };
   } catch (err) {
     console.log('Error enviando push:', err.message);
+    return { ok: false, stage: 'envio', error: err.message };
+  }
+}
+
+// Recibo de Expo: dice si Apple/Google aceptaron la notificacion (ej. InvalidCredentials, DeviceNotRegistered)
+async function checkPushReceipt(toUsername, ticketId) {
+  const res = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: [ticketId] }),
+  });
+  const data = await res.json();
+  const receipt = data.data?.[ticketId] ?? null;
+  logPushProblem(toUsername, 'entrega', receipt, data.errors);
+  const row = (await pool.query('SELECT push_token FROM users WHERE username = $1', [toUsername])).rows[0];
+  if (row?.push_token) await clearPushTokenIfUnregistered(toUsername, row.push_token, receipt);
+  return receipt;
+}
+
+const pushTestResults = new Map(); // username -> resultado de la ultima prueba, si no se pudo entregar
+
+async function notifyUser(toUsername, preview) {
+  const sent = await sendPushNotification(toUsername, preview);
+  if (sent.ticketId) {
+    setTimeout(() => checkPushReceipt(toUsername, sent.ticketId).catch((e) => console.log('Error obteniendo recibo de push:', e.message)), 15000);
   }
 }
 
@@ -618,6 +638,12 @@ wss.on('connection', (socket, req) => {
     onlineUsers.set(username, { socket, tokenHash, active: true });
     sendUserList(username);
     notifyWatchers(username);
+    // Resultado de una prueba de notificaciones que termino con el telefono bloqueado
+    const pendingTest = pushTestResults.get(username);
+    if (pendingTest) {
+      pushTestResults.delete(username);
+      sendJson(socket, { type: 'test-push-result', ...pendingTest });
+    }
 
     // Los mensajes se quedan en inbox hasta que el telefono confirme (ack) que los guardo
     const pending = await pool.query('SELECT id, from_username, envelope FROM inbox WHERE to_username = $1 ORDER BY id ASC', [username]);
@@ -869,6 +895,37 @@ wss.on('connection', (socket, req) => {
           entry.active = active;
           notifyWatchers(myUsername);
         }
+        const pendingTest = active ? pushTestResults.get(myUsername) : null;
+        if (pendingTest) {
+          pushTestResults.delete(myUsername);
+          sendJson(socket, { type: 'test-push-result', ...pendingTest });
+        }
+        return;
+      }
+
+      if (parsed.type === 'test-push') {
+        // Prueba desde Ajustes: espera unos segundos (para bloquear el telefono), manda un aviso y revisa el recibo
+        const delay = Math.min(Math.max(Number(parsed.delayMs) || 0, 0), 15000);
+        const username = myUsername;
+        setTimeout(async () => {
+          let report;
+          try {
+            const sent = await sendPushNotification(username, null, { test: true });
+            report = sent;
+            if (sent.ticketId) {
+              await new Promise((r) => setTimeout(r, 5000));
+              const receipt = await checkPushReceipt(username, sent.ticketId);
+              if (receipt && receipt.status === 'error') report = { ok: false, stage: 'entrega', error: receipt.details?.error || receipt.message || 'Apple/Google la rechazaron' };
+              else report = { ...sent, delivered: !!receipt };
+            }
+          } catch (err) {
+            report = { ok: false, stage: 'servidor', error: err.message };
+          }
+          delete report.ticketId;
+          const online = onlineUsers.get(username);
+          if (online && online.socket.readyState === online.socket.OPEN && online.active) sendJson(online.socket, { type: 'test-push-result', ...report });
+          else pushTestResults.set(username, report); // se entrega al volver a abrir la app
+        }, delay);
         return;
       }
 
@@ -880,6 +937,7 @@ wss.on('connection', (socket, req) => {
             'UPDATE users SET push_token = $1, push_platform = $2, push_previews = $3 WHERE username = $4',
             [parsed.token, platform, parsed.previews === true && !!platform, myUsername]
           );
+          sendJson(socket, { type: 'push-token-saved' });
         }
         return;
       }
@@ -942,7 +1000,7 @@ wss.on('connection', (socket, req) => {
         }
         // Con el telefono bloqueado o la app en segundo plano la conexion puede seguir viva un rato; igual se avisa
         if (!silent && (!connected || !recipient.active)) {
-          await sendPushNotification(to, preview);
+          await notifyUser(to, preview);
         }
         return;
       }
