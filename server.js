@@ -127,15 +127,17 @@ async function initDatabase() {
 // Supabase publica las tablas de "public" en su API REST (anon/authenticated). Nadie debe usarla: todo pasa por este
 // servidor, que es el dueño de las tablas y por eso no le afecta RLS. RLS sin politicas + sin permisos = API cerrada.
 const APP_TABLES = ['users', 'inbox', 'auth_sessions', 'contacts', 'meta', 'media_objects'];
+// Tabla del protocolo v1 que ya no se usa pero sigue en la BD (con remitentes y mensajes viejos): tambien se cierra
+const LEGACY_TABLES = ['pending_messages'];
 
 async function lockDownTables() {
-  for (const table of APP_TABLES) {
+  for (const table of [...APP_TABLES, ...LEGACY_TABLES]) {
     for (const sql of [`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`, `REVOKE ALL ON TABLE ${table} FROM anon, authenticated`]) {
       try {
         await pool.query(sql);
       } catch (err) {
-        // Fuera de Supabase (pruebas) no existen esos roles
-        if (!/role .* does not exist|not supported|syntax/i.test(err.message)) console.log(`No se pudo proteger la tabla ${table}:`, err.message);
+        // Fuera de Supabase (pruebas) no existen esos roles; la tabla vieja puede no existir
+        if (!/does not exist|not supported|syntax/i.test(err.message)) console.log(`No se pudo proteger la tabla ${table}:`, err.message);
       }
     }
   }
@@ -228,6 +230,9 @@ function getClientIp(req) {
 
 const TOO_MANY_ATTEMPTS_ERROR = 'Demasiados intentos fallidos, espera unos minutos';
 
+// Cuentas nuevas por IP en 15 minutos, para que nadie llene la base con cuentas basura (las pruebas lo suben)
+const REGISTER_LIMIT_PER_IP = Number(process.env.REGISTER_LIMIT_PER_IP) || 5;
+
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
@@ -239,7 +244,7 @@ async function createAuthSession(username) {
 }
 
 const http = require('http');
-const { Readable } = require('stream');
+const { Readable, pipeline } = require('stream');
 
 // Los archivos cifrados pasan por este servidor en vez de ir directo a Supabase desde el telefono:
 // algunas redes bloquean *.supabase.co, y asi los buckets pueden ser privados.
@@ -330,7 +335,8 @@ async function handleMediaRequest(req, res, bucket, path) {
     const length = upstream.headers.get('content-length');
     if (length) headers['Content-Length'] = length;
     res.writeHead(200, headers);
-    Readable.fromWeb(upstream.body).on('error', () => res.destroy()).pipe(res);
+    // pipeline cierra la descarga de Supabase si el telefono corta (con pipe se quedaba abierta y colgada)
+    pipeline(Readable.fromWeb(upstream.body), res, () => {});
     return;
   }
 
@@ -450,7 +456,11 @@ function sendUserList(username) {
     const presence = onlineUsers.get(contact);
     users.push({ username: contact, profilePicture: info.profilePicture, identity: info.identity, online: !!presence && presence.active });
   }
-  sendJson(online.socket, { type: 'user-list', users, me: { username, profilePicture: me?.profilePicture || null } });
+  // Lleva las fotos de perfil: si nada cambio desde la ultima vez (ej. el repaso de cada 30 s) no se vuelve a mandar
+  const json = JSON.stringify({ type: 'user-list', users, me: { username, profilePicture: me?.profilePicture || null } });
+  if (online.lastUserList === json || online.socket.readyState !== online.socket.OPEN) return;
+  online.lastUserList = json;
+  online.socket.send(json);
 }
 
 // Avisa a quienes tienen a `username` como contacto (cambio de conexion, foto o llaves)
@@ -678,6 +688,10 @@ wss.on('connection', (socket, req) => {
         if (parsed.v !== PROTOCOL_VERSION) return rejectOldClient('register-result');
         const { username, password, identity, spk } = parsed;
 
+        if (isAuthBlocked(`register:${clientIp}`, REGISTER_LIMIT_PER_IP)) {
+          sendJson(socket, { type: 'register-result', success: false, error: 'Demasiadas cuentas nuevas desde esta conexión, espera unos minutos' });
+          return;
+        }
         const validationError = validateNewUsername(username) || validateNewPassword(password)
           || (isValidIdentity(identity) && isValidSignedPreKey(spk) ? null : 'Llaves invalidas');
         if (validationError) {
@@ -707,6 +721,7 @@ wss.on('connection', (socket, req) => {
           return;
         }
         knownUsers.set(username, { profilePicture: null, identity, spk });
+        recordFailedAuth(`register:${clientIp}`, REGISTER_LIMIT_PER_IP);
         const token = await createAuthSession(username);
         console.log(`Nueva cuenta registrada: ${username}`);
         sendJson(socket, { type: 'register-result', success: true, recoveryCode, token });
@@ -933,6 +948,8 @@ wss.on('connection', (socket, req) => {
         if (isNonEmptyString(parsed.token, 500)) {
           // Las versiones anteriores no mandan platform/previews: siguen recibiendo la notificacion generica
           const platform = parsed.platform === 'ios' || parsed.platform === 'android' ? parsed.platform : null;
+          // Un telefono solo recibe avisos de la cuenta abierta en el: si antes se uso otra cuenta ahi, se le quita
+          await pool.query('UPDATE users SET push_token = NULL WHERE push_token = $1 AND username <> $2', [parsed.token, myUsername]);
           await pool.query(
             'UPDATE users SET push_token = $1, push_platform = $2, push_previews = $3 WHERE username = $4',
             [parsed.token, platform, parsed.previews === true && !!platform, myUsername]
