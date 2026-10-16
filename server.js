@@ -1100,7 +1100,19 @@ async function periodicCleanup() {
 }
 const cleanupInterval = setInterval(periodicCleanup, 6 * 60 * 60 * 1000);
 
+// Render (plan gratis) apaga el servidor tras 15 min sin trafico y despertarlo tarda ~1 min: los mensajes se quedaban
+// con el reloj. El aviso de GitHub Actions cada 10 min llega con horas de atraso, asi que el servidor se visita a si
+// mismo por su direccion publica (pasa por Render y cuenta como trafico). RENDER_EXTERNAL_URL lo pone Render.
+const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL;
+const SELF_PING_INTERVAL_MS = 10 * 60 * 1000;
+const selfPingInterval = SELF_PING_URL
+  ? setInterval(() => {
+      fetch(SELF_PING_URL, { signal: AbortSignal.timeout(30000) }).catch((err) => console.log('No se pudo auto-visitar el servidor:', err.message));
+    }, SELF_PING_INTERVAL_MS)
+  : null;
+
 wss.on('close', () => {
+  if (selfPingInterval) clearInterval(selfPingInterval);
   clearInterval(heartbeatInterval);
   clearInterval(userListRefreshInterval);
   clearInterval(failedAuthCleanupInterval);
@@ -1144,6 +1156,7 @@ initDatabase()
     });
     httpServer.listen(PORT, () => {
       console.log(`Servidor de chat corriendo en el puerto ${PORT}`);
+      console.log(SELF_PING_URL ? `Auto-visita cada 10 min a ${SELF_PING_URL} para que Render no lo apague` : 'Sin auto-visita (falta RENDER_EXTERNAL_URL)');
       if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
         console.log('Aviso: faltan SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY, los archivos de Supabase no se borraran');
       }
